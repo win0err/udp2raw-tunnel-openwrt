@@ -1,0 +1,229 @@
+#!/bin/sh /etc/rc.common
+
+# udp2raw procd init script.
+#
+# Reads /etc/config/udp2raw and starts one procd instance per configured
+# section. By default each instance runs as nobody:nogroup and uses file
+# capabilities (cap_net_raw, cap_net_admin, cap_net_bind_service) applied
+# by apply_caps(), so root is not required.
+#
+# Set option run_as_root '1' to keep the instance running as root -- needed
+# if you want to use udp2raw's native --auto-rule (add it via extra_args)
+# or if file capabilities are unavailable on the system.
+#
+# Only non-empty UCI options are passed on the command line; udp2raw's own
+# defaults apply for everything else.
+#
+# If auto_firewall is enabled, an iptables rule is generated from the raw
+# mode, remote address and port, then applied as root (the init script runs
+# as root). Applied rules are tracked in STATE_FILE so they can be removed
+# on stop even if the config has changed in the meantime. NOTE: this is
+# redundant with udp2raw's --auto-rule -- don't enable both.
+
+START=99
+USE_PROCD=1
+
+PROG=/usr/bin/udp2raw
+USER=nobody
+GROUP=nogroup
+CAPS="cap_net_raw,cap_net_admin,cap_net_bind_service=eip"
+STATE_FILE="/tmp/udp2raw-firewall-rules.list"
+
+# Re-apply file capabilities to the binary before each start. setcap is
+# idempotent, and re-applying it survives binary upgrades (opkg drops xattrs
+# when replacing the file).
+apply_caps() {
+	command -v setcap >/dev/null 2>&1 || return 0
+	[ -x "$PROG" ] || return 0
+	setcap "$CAPS" "$PROG" 2>/dev/null
+	return 0
+}
+
+# Generate the body of an iptables rule (without the iptables prefix and
+# without -I/-D). Tries udp2raw -g first -- that's exactly the rule udp2raw
+# itself would add with --auto-rule, so it stays in sync with the binary.
+# Falls back to a hardcoded rule if udp2raw -g produces no usable output.
+generate_firewall_rule() {
+	local args="$1"
+	local raw_mode="${2:-faketcp}"
+	local addr="$3"
+	local port="$4"
+
+	# Ask udp2raw to print the rule. Real output looks like:
+	#   generated iptables rule:
+	#   iptables -I INPUT -s 1.2.3.4 -p tcp -m tcp --sport 24855 -j DROP
+	# Match only lines that *start* with `iptables -I` / `iptables -A`, otherwise
+	# the leading "generated iptables rule:" line is matched too and we end up
+	# trying to run `iptables -I generated iptables rule:`.
+	local line body
+	line=$("$PROG" $args -g 2>/dev/null | grep -E '^iptables[[:space:]]+-[IA][[:space:]]' | head -n1)
+	if [ -n "$line" ]; then
+		# Strip the "iptables -I " (or -A) prefix.
+		body=$(echo "$line" | sed 's/^iptables[[:space:]]\+-[IA][[:space:]]\+//')
+		if [ -n "$body" ]; then
+			echo "$body"
+			return 0
+		fi
+	fi
+
+	# Fallback: hardcoded rules for older udp2raw or unusual outputs.
+	[ -z "$addr" ] && return 0
+	case "$raw_mode" in
+		faketcp|easy-faketcp)
+			echo "INPUT -s $addr -p tcp -m tcp --sport $port -j DROP"
+			;;
+		udp)
+			echo "INPUT -s $addr -p udp -m udp --sport $port -j DROP"
+			;;
+		icmp)
+			echo "INPUT -s $addr -p icmp -j DROP"
+			;;
+	esac
+}
+
+# Apply one firewall rule. Argument: rule body without the iptables prefix
+# and without -I/-D (the init script adds those). Idempotent.
+apply_firewall_rule() {
+	local rule="$1"
+	[ -z "$rule" ] && return 0
+
+	if ! command -v iptables >/dev/null 2>&1; then
+		logger -t udp2raw "iptables not found, skipping firewall rule: $rule"
+		return 0
+	fi
+
+	iptables -D $rule 2>/dev/null
+	if iptables -I $rule 2>/dev/null; then
+		echo "$rule" >> "$STATE_FILE"
+	else
+		logger -t udp2raw "iptables -I $rule failed"
+	fi
+}
+
+# Remove all firewall rules tracked in STATE_FILE.
+remove_all_firewall_rules() {
+	[ -f "$STATE_FILE" ] || return 0
+	command -v iptables >/dev/null 2>&1 || return 0
+
+	local rule
+	while IFS= read -r rule; do
+		[ -n "$rule" ] && iptables -D $rule 2>/dev/null
+	done < "$STATE_FILE"
+	rm -f "$STATE_FILE"
+}
+
+start_instance() {
+	local section="$1"
+	local disabled
+	local mode local_addr local_port remote_addr remote_port password
+	local raw_mode cipher_mode auth_mode log_level lower_level
+	local source_ip source_port sock_buf seq_mode dev
+	local fix_gro retry_on_error disable_anti_replay
+	local log_position disable_color disable_bpf
+	local auto_firewall run_as_root extra_args args
+
+	config_get_bool disabled "$section" 'disabled' 0
+	[ "$disabled" -eq 1 ] && return 0
+
+	# Required fields.
+	config_get mode        "$section" 'mode'        'c'
+	config_get local_addr  "$section" 'local_addr'  '0.0.0.0'
+	config_get local_port  "$section" 'local_port'
+	config_get remote_addr "$section" 'remote_addr'
+	config_get remote_port "$section" 'remote_port'
+	config_get password    "$section" 'password'
+
+	# Without ports/addresses there is nothing to run.
+	[ -z "$local_port" ] || [ -z "$remote_addr" ] || [ -z "$remote_port" ] && return 0
+
+	args="-$mode -l $local_addr:$local_port -r $remote_addr:$remote_port"
+	[ -n "$password" ] && args="$args -k $password"
+
+	# Encryption / authentication -- only pass when explicitly set, otherwise
+	# udp2raw defaults apply (raw-mode=faketcp, cipher-mode=aes128cbc, auth-mode=md5).
+	config_get raw_mode    "$section" 'raw_mode'
+	config_get cipher_mode "$section" 'cipher_mode'
+	config_get auth_mode   "$section" 'auth_mode'
+	[ -n "$raw_mode"    ] && args="$args --raw-mode $raw_mode"
+	[ -n "$cipher_mode" ] && args="$args --cipher-mode $cipher_mode"
+	[ -n "$auth_mode"   ] && args="$args --auth-mode $auth_mode"
+
+	# Network.
+	config_get source_ip   "$section" 'source_ip'
+	config_get source_port "$section" 'source_port'
+	config_get sock_buf    "$section" 'sock_buf'
+	config_get seq_mode    "$section" 'seq_mode'
+	config_get dev         "$section" 'dev'
+	config_get lower_level "$section" 'lower_level'
+	[ -n "$source_ip"   ] && args="$args --source-ip $source_ip"
+	[ -n "$source_port" ] && args="$args --source-port $source_port"
+	[ -n "$sock_buf"    ] && args="$args --sock-buf $sock_buf"
+	[ -n "$seq_mode"    ] && args="$args --seq-mode $seq_mode"
+	[ -n "$dev"         ] && args="$args --dev $dev"
+	[ -n "$lower_level" ] && args="$args --lower-level $lower_level"
+
+	# Behaviour flags -- pass only when explicitly enabled.
+	config_get_bool fix_gro             "$section" 'fix_gro'             0
+	config_get_bool retry_on_error      "$section" 'retry_on_error'      0
+	config_get_bool disable_anti_replay "$section" 'disable_anti_replay' 0
+	config_get_bool log_position        "$section" 'log_position'        0
+	config_get_bool disable_color       "$section" 'disable_color'       0
+	config_get_bool disable_bpf         "$section" 'disable_bpf'         0
+	[ "$fix_gro"             -eq 1 ] && args="$args --fix-gro"
+	[ "$retry_on_error"      -eq 1 ] && args="$args --retry-on-error"
+	[ "$disable_anti_replay" -eq 1 ] && args="$args --disable-anti-replay"
+	[ "$log_position"        -eq 1 ] && args="$args --log-position"
+	[ "$disable_color"       -eq 1 ] && args="$args --disable-color"
+	[ "$disable_bpf"         -eq 1 ] && args="$args --disable-bpf"
+
+	# Logging.
+	config_get log_level "$section" 'log_level'
+	[ -n "$log_level" ] && args="$args --log-level $log_level"
+
+	# Auto firewall rule (generated, not user-provided).
+	config_get_bool auto_firewall "$section" 'auto_firewall' 0
+	if [ "$auto_firewall" -eq 1 ]; then
+		# Pass the full built command line plus -g; udp2raw prints the rule and exits.
+		fw_rule=$(generate_firewall_rule "$args" "$raw_mode" "$remote_addr" "$remote_port")
+		apply_firewall_rule "$fw_rule"
+	fi
+
+	# Power-user escape hatch.
+	config_get extra_args "$section" 'extra_args'
+	[ -n "$extra_args" ] && args="$args $extra_args"
+
+	# Privileges. Default: drop to nobody:nogroup (file capabilities grant
+	# cap_net_raw/cap_net_admin/cap_net_bind_service). Set run_as_root=1 to
+	# keep root -- needed for udp2raw's native --auto-rule or on systems
+	# without file-capability support.
+	config_get_bool run_as_root "$section" 'run_as_root' 0
+
+	# Launch.
+	procd_open_instance "$section"
+	procd_set_param command "$PROG" $args
+	if [ "$run_as_root" -ne 1 ]; then
+		procd_set_param user "$USER"
+		procd_set_param group "$GROUP"
+	fi
+	procd_set_param respawn
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+start_service() {
+	apply_caps
+	# On reload, start from a clean rule list.
+	rm -f "$STATE_FILE"
+	config_load 'udp2raw'
+	config_foreach start_instance 'udp2raw'
+}
+
+stop_service() {
+	remove_all_firewall_rules
+}
+
+reload_service() {
+	stop
+	start
+}

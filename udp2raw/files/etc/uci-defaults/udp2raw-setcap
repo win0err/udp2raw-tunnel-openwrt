@@ -1,0 +1,12 @@
+#!/bin/sh
+
+# One-shot uci-defaults script: apply file capabilities to the udp2raw binary
+# on first boot / right after install, so it can run as non-root. The init
+# script re-applies them on every start, so failure here is non-fatal.
+
+[ -x /usr/bin/udp2raw ] || exit 0
+command -v setcap >/dev/null 2>&1 || exit 0
+
+setcap cap_net_raw,cap_net_admin,cap_net_bind_service=eip /usr/bin/udp2raw 2>/dev/null
+
+exit 0

@@ -1,0 +1,17 @@
+{
+  "luci-app-udp2raw": {
+    "description": "Grant UCI and ubus access for luci-app-udp2raw",
+    "read": {
+      "ubus": {
+        "luci.udp2raw": ["getInitList", "getInitStatus"]
+      },
+      "uci": ["udp2raw"]
+    },
+    "write": {
+      "uci": ["udp2raw"],
+      "ubus": {
+        "luci.udp2raw": ["setInitAction"]
+      }
+    }
+  }
+}

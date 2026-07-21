@@ -1,0 +1,30 @@
+# udp2raw tunnels configuration.
+#
+# Add a new tunnel from CLI:
+#   uci add udp2raw udp2raw
+#   uci set udp2raw.@udp2raw[-1].remote_addr='server.example.com'
+#   uci set udp2raw.@udp2raw[-1].remote_port='24855'
+#   uci set udp2raw.@udp2raw[-1].local_port='24855'
+#   uci set udp2raw.@udp2raw[-1].password='secret'
+#   uci commit udp2raw
+#   /etc/init.d/udp2raw restart
+#
+# Or use the LuCI interface at Services -> udp2raw.
+#
+# Only non-empty options are passed on the udp2raw command line; udp2raw's
+# own defaults apply for anything left unset.
+#
+# Example section (disabled by default, uncomment and edit to enable):
+
+#config udp2raw 'client1'
+#    option disabled     '0'
+#    option mode         'c'
+#    option local_addr   '0.0.0.0'
+#    option local_port   '24855'
+#    option remote_addr  'remote.server.com'
+#    option remote_port  '24855'
+#    option password     'REDACTED'
+#    # raw_mode / cipher_mode / auth_mode left unset: udp2raw defaults
+#    # (faketcp / aes128cbc / md5) apply. Override only when needed.
+#    option auto_firewall '1'
+#    option extra_args   '--mtu-warn 1375 --hb-len 1024'

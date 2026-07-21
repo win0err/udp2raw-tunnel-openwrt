@@ -1,0 +1,13 @@
+{
+    "admin/services/udp2raw": {
+        "title": "udp2raw",
+        "order": 60,
+        "action": {
+            "type": "view",
+            "path": "udp2raw/udp2raw"
+        },
+        "depends": {
+            "fs": "/etc/config/udp2raw"
+        }
+    }
+}

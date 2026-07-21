@@ -1,0 +1,222 @@
+name: Build packages
+
+# Builds udp2raw and luci-app-udp2raw for stable OpenWrt releases:
+#   * 24.10.x -> .ipk packages (installed with opkg)
+#   * 25.12.x -> .apk packages (installed with apk)
+# Uses the prebuilt ghcr.io/openwrt/sdk Docker images (per arch + release),
+# which is faster than downloading and extracting the SDK on every run.
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-binary:
+    name: udp2raw / ${{ matrix.release }} / ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Active target: Raspberry Pi 3, many modern ARM64 routers.
+          - { release: "v24.10.7", arch: aarch64_cortex-a53 }
+          - { release: "v25.12.5", arch: aarch64_cortex-a53 }
+
+          # ARM64 (uncomment to enable)
+          # - { release: "v24.10.7", arch: aarch64_generic }       # generic ARM64 (armsr)
+          # - { release: "v25.12.5", arch: aarch64_generic }
+          # - { release: "v24.10.7", arch: aarch64_cortex-a72 }     # RPi 4, MT7986 (filogic)
+          # - { release: "v25.12.5", arch: aarch64_cortex-a72 }
+          # - { release: "v24.10.7", arch: aarch64_cortex-a76 }     # RPi 5, newer filogic
+          # - { release: "v25.12.5", arch: aarch64_cortex-a76 }
+
+          # ARM 32-bit (Mediatek, Qualcomm IPQ, mvebu)
+          # - { release: "v24.10.7", arch: arm_cortex-a7 }              # MT7623, IPQ40xx
+          # - { release: "v25.12.5", arch: arm_cortex-a7 }
+          # - { release: "v24.10.7", arch: arm_cortex-a7_neon-vfpv4 }  # IPQ40xx with NEON
+          # - { release: "v25.12.5", arch: arm_cortex-a7_neon-vfpv4 }
+          # - { release: "v24.10.7", arch: arm_cortex-a9 }              # mvebu (Linksys WRT)
+          # - { release: "v25.12.5", arch: arm_cortex-a9 }
+          # - { release: "v24.10.7", arch: arm_cortex-a9_neon }         # mvebu with NEON
+          # - { release: "v25.12.5", arch: arm_cortex-a9_neon }
+          # - { release: "v24.10.7", arch: arm_cortex-a15_neon-vfpv4 }  # ipq806x (Netgear R7000)
+          # - { release: "v25.12.5", arch: arm_cortex-a15_neon-vfpv4 }
+
+          # MIPS (Atheros ath79, Mediatek MT7621)
+          # - { release: "v24.10.7", arch: mips_24kc }      # ath79 (very common)
+          # - { release: "v25.12.5", arch: mips_24kc }
+          # - { release: "v24.10.7", arch: mipsel_24kc }    # MT7621 (very common)
+          # - { release: "v25.12.5", arch: mipsel_24kc }
+          # - { release: "v24.10.7", arch: mipsel_74kc }    # some older Atheros
+          # - { release: "v25.12.5", arch: mipsel_74kc }
+
+          # x86 (PCs, VMs, soft routers)
+          # - { release: "v24.10.7", arch: x86_64 }
+          # - { release: "v25.12.5", arch: x86_64 }
+
+          # RISC-V (emerging; may be missing in 24.10)
+          # - { release: "v24.10.7", arch: riscv64_generic }
+          # - { release: "v25.12.5", arch: riscv64_generic }
+    container:
+      image: ghcr.io/openwrt/sdk:${{ matrix.arch }}-${{ matrix.release }}
+      options: --user root
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v5
+
+      - name: Copy package into SDK
+        run: |
+          mkdir -p /builder/package/udp2raw
+          cp -r "$GITHUB_WORKSPACE/udp2raw" /builder/package/udp2raw/
+
+      - name: Configure feeds (GitHub mirrors for speed)
+        working-directory: /builder
+        run: |
+          cp feeds.conf.default feeds.conf
+          sed -i 's|git.openwrt.org/openwrt/openwrt.git|github.com/openwrt/openwrt.git|g' feeds.conf
+          sed -i 's|git.openwrt.org/feed/packages.git|github.com/openwrt/packages.git|g' feeds.conf
+          ./scripts/feeds update base
+          ./scripts/feeds install -a
+
+      - name: Configure
+        working-directory: /builder
+        run: make defconfig
+
+      - name: Build udp2raw
+        working-directory: /builder
+        run: |
+          # Compile ONLY this package -- avoids the package/index step that
+          # signs the index and would fail without a usign key-build file.
+          make package/udp2raw/udp2raw/compile -j"$(nproc)" V=s
+
+      - name: Collect package
+        run: |
+          mkdir -p "$RUNNER_TEMP/artifacts"
+          # Packages may be .ipk (24.10) or .apk (25.12).
+          # Pattern 'udp2raw*.[ai]pk' does NOT match 'luci-app-udp2raw*'
+          # because the latter starts with 'luci', not 'udp2raw'.
+          find /builder/bin/packages -type f -name 'udp2raw*.[ai]pk' \
+            ! -name 'luci-app-udp2raw*' \
+            -exec cp {} "$RUNNER_TEMP/artifacts/" \;
+          ls -la "$RUNNER_TEMP/artifacts/"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: udp2raw-${{ matrix.release }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/artifacts/*
+          if-no-files-found: error
+          retention-days: 30
+
+  build-luci:
+    name: luci-app-udp2raw / ${{ matrix.release }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # luci-app-udp2raw is PKGARCH:=all, but the package format differs
+          # between releases (.ipk for 24.10, .apk for 25.12), so build twice.
+          - { release: "v24.10.7" }
+          - { release: "v25.12.5" }
+    container:
+      # Any SDK works since the package is PKGARCH:=all. aarch64_cortex-a53
+      # is small, common, and matches the binary job's image (cached on the
+      # runner if binary job ran first).
+      image: ghcr.io/openwrt/sdk:aarch64_cortex-a53-${{ matrix.release }}
+      options: --user root
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v5
+
+      - name: Copy packages into SDK
+        run: |
+          # Both packages are needed: luci-app-udp2raw depends on udp2raw
+          # at build time, so its Makefile must be available to satisfy DEPENDS.
+          mkdir -p /builder/package/udp2raw
+          cp -r "$GITHUB_WORKSPACE/udp2raw"          /builder/package/udp2raw/
+          cp -r "$GITHUB_WORKSPACE/luci-app-udp2raw" /builder/package/udp2raw/
+
+      - name: Configure feeds (GitHub mirrors for speed)
+        working-directory: /builder
+        run: |
+          cp feeds.conf.default feeds.conf
+          sed -i 's|git.openwrt.org/openwrt/openwrt.git|github.com/openwrt/openwrt.git|g' feeds.conf
+          sed -i 's|git.openwrt.org/feed/packages.git|github.com/openwrt/packages.git|g' feeds.conf
+          sed -i 's|git.openwrt.org/project/luci.git|github.com/openwrt/luci.git|g' feeds.conf
+          ./scripts/feeds update base luci
+          ./scripts/feeds install -a
+
+      - name: Configure
+        working-directory: /builder
+        run: |
+          make defconfig
+          # Disable JS minifier and CSS tidy -- avoids the nodejs dependency.
+          sed -i 's/CONFIG_LUCI_JSMIN=y/CONFIG_LUCI_JSMIN=n/g' .config
+          sed -i 's/CONFIG_LUCI_CSSTIDY=y/CONFIG_LUCI_CSSTIDY=n/g' .config
+          grep -q '^CONFIG_LUCI_JSMIN='   .config || echo 'CONFIG_LUCI_JSMIN=n'   >> .config
+          grep -q '^CONFIG_LUCI_CSSTIDY=' .config || echo 'CONFIG_LUCI_CSSTIDY=n' >> .config
+
+      - name: Build luci-app-udp2raw
+        working-directory: /builder
+        run: |
+          # This also builds udp2raw as a build-time dependency; the
+          # resulting .ipk/.apk is discarded below by the name filter.
+          make package/udp2raw/luci-app-udp2raw/compile -j"$(nproc)" V=s
+
+      - name: Collect package
+        run: |
+          mkdir -p "$RUNNER_TEMP/artifacts"
+          find /builder/bin/packages -type f -name 'luci-app-udp2raw*.[ai]pk' \
+            -exec cp {} "$RUNNER_TEMP/artifacts/" \;
+          ls -la "$RUNNER_TEMP/artifacts/"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: luci-app-udp2raw-${{ matrix.release }}
+          path: ${{ runner.temp }}/artifacts/*
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Attach packages to release
+    needs: [build-binary, build-luci]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: all-artifacts
+          merge-multiple: true
+      - name: Upload to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: all-artifacts/*
+          body: |
+            Pre-built packages for OpenWrt 24.10 (`.ipk`) and 25.12 (`.apk`).
+
+            Files:
+            * `udp2raw_*_<arch>.ipk`      -- OpenWrt 24.10
+            * `udp2raw-*-<arch>.apk`      -- OpenWrt 25.12
+            * `luci-app-udp2raw*.ipk`     -- OpenWrt 24.10
+            * `luci-app-udp2raw*.apk`     -- OpenWrt 25.12
+
+            Install on the router (or use `install.sh` from the repo):
+            ```
+            # 24.10 (opkg)
+            opkg install udp2raw_*.ipk luci-app-udp2raw*.ipk
+
+            # 25.12 (apk)
+            apk add --allow-untrusted udp2raw-*.apk luci-app-udp2raw-*.apk
+            ```

@@ -1,0 +1,116 @@
+#!/bin/sh
+# rpcd backend for luci-app-udp2raw.
+#
+# Registers the ubus object "luci.udp2raw" with the standard service-control
+# methods used by the LuCI status module:
+#
+#   ubus -v list luci.udp2raw
+#   ubus -S call luci.udp2raw getInitList   '{"name": "udp2raw"}'
+#   ubus -S call luci.udp2raw getInitStatus '{"name": "udp2raw"}'
+#   ubus -S call luci.udp2raw setInitAction '{"name": "udp2raw", "action": "restart"}'
+#
+# Mirrors the layout of luci-app-https-dns-proxy's backend.
+
+# TechRef: https://openwrt.org/docs/techref/rpcd
+
+readonly packageName="udp2raw"
+
+. "${IPKG_INSTROOT}/lib/functions.sh"
+. "${IPKG_INSTROOT}/usr/share/libubox/jshn.sh"
+
+is_enabled() { "/etc/init.d/${1}" enabled >/dev/null 2>&1; }
+# rc.common provides "running" on modern OpenWrt; fall back to "status"
+# (exit 0 means running) for older releases where "running" is missing.
+is_running() {
+	"/etc/init.d/${1}" running >/dev/null 2>&1 || "/etc/init.d/${1}" status >/dev/null 2>&1
+}
+logger() { /usr/bin/logger -t "$packageName" "$@"; }
+print_json_bool() { json_init; json_add_boolean "$1" "$2"; json_dump; json_cleanup; }
+
+get_init_list() {
+	local name
+	name="$(basename "$1")"
+	name="${name:-${packageName}}"
+	json_init
+	json_add_object "$name"
+	if is_enabled "$name"; then
+		json_add_boolean 'enabled' '1'
+	else
+		json_add_boolean 'enabled' '0'
+	fi
+	if is_running "$name"; then
+		json_add_boolean 'running' '1'
+	else
+		json_add_boolean 'running' '0'
+	fi
+	json_close_object
+	json_dump
+	json_cleanup
+}
+
+# For udp2raw there are no extra platform/provider fields, so getInitStatus
+# currently returns the same payload as getInitList.  It exists as a separate
+# method to keep the door open for version/instance details later without
+# touching the LuCI side.
+get_init_status() {
+	get_init_list "$1"
+}
+
+set_init_action() {
+	local action="$2" cmd
+	[ "$(basename "$1")" = "$packageName" ] || { print_json_bool 'result' '0'; return 1; }
+	case "$action" in
+		enable|disable|start|stop|restart)
+			cmd="/etc/init.d/${packageName} ${action}"
+		;;
+	esac
+	if [ -n "$cmd" ] && eval "$cmd" >/dev/null 2>&1; then
+		print_json_bool 'result' '1'
+	else
+		print_json_bool 'result' '0'
+	fi
+}
+
+case "$1" in
+	list)
+		json_init
+		json_add_object "getInitList"
+			json_add_string 'name' "name"
+		json_close_object
+		json_add_object "getInitStatus"
+			json_add_string 'name' 'name'
+		json_close_object
+		json_add_object "setInitAction"
+			json_add_string 'name' "name"
+			json_add_string 'action' "action"
+		json_close_object
+		json_dump
+		json_cleanup
+		;;
+	call)
+		case "$2" in
+			getInitList)
+				read -r input
+				json_load "$input"
+				json_get_var name "name"
+				json_cleanup
+				get_init_list "$name"
+				;;
+			getInitStatus)
+				read -r input
+				json_load "$input"
+				json_get_var name 'name'
+				json_cleanup
+				get_init_status "$name"
+				;;
+			setInitAction)
+				read -r input
+				json_load "$input"
+				json_get_var name "name"
+				json_get_var action "action"
+				json_cleanup
+				set_init_action "$name" "$action"
+				;;
+		esac
+	;;
+esac

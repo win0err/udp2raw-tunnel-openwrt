@@ -1,0 +1,11 @@
+#!/bin/sh
+# On install/upgrade of luci-app-udp2raw: drop the LuCI bytecode/index caches
+# so the new view + status module are picked up, and reload rpcd so the new
+# ubus object "luci.udp2raw" (from /usr/libexec/rpcd/luci.udp2raw) is
+# registered. Runs once and is deleted by the uci-defaults machinery.
+
+rm -rf /var/luci-modulecache/
+rm -f /var/luci-indexcache
+[ -x /etc/init.d/rpcd ] && /etc/init.d/rpcd reload
+
+exit 0
